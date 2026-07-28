@@ -41,7 +41,7 @@ export function feedbackError() {
   vibrate([90, 70, 90, 70, 90])
 }
 
-// Вызвать при первом клике пользователя, чтобы iOS разрешил звук
+// Вызвать при первом касании пользователя, чтобы iOS разрешил звук
 export function unlockAudio() {
   try {
     const AudioCtx = window.AudioContext || window.webkitAudioContext

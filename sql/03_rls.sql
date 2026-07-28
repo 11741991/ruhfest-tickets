@@ -17,9 +17,9 @@ alter table public.tickets   enable row level security;
 alter table public.scan_logs enable row level security;
 
 -- Убираем возможные старые политики
-drop policy if exists tickets_select_staff  on public.tickets;
-drop policy if exists tickets_insert_staff  on public.tickets;
-drop policy if exists tickets_update_staff  on public.tickets;
+drop policy if exists tickets_select_staff   on public.tickets;
+drop policy if exists tickets_insert_staff   on public.tickets;
+drop policy if exists tickets_update_staff   on public.tickets;
 drop policy if exists scan_logs_select_staff on public.scan_logs;
 drop policy if exists scan_logs_insert_staff on public.scan_logs;
 
@@ -72,7 +72,7 @@ revoke all on public.scan_logs from anon;
 -- Права на таблицы и sequence для сотрудников
 -- (nextval нужен для автогенерации ticket_number при INSERT)
 -- ------------------------------------------------------------
-grant select, insert, update on public.tickets   to authenticated;
-grant select, insert          on public.scan_logs to authenticated;
+grant select, insert, update on public.tickets    to authenticated;
+grant select, insert         on public.scan_logs  to authenticated;
 grant usage, select on sequence public.ticket_number_seq to authenticated;
 grant execute on function public.generate_ticket_token() to authenticated;

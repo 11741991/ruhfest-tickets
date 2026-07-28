@@ -1,10 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Html5Qrcode } from 'html5-qrcode'
+import jsQR from 'jsqr'
 import { supabase } from '../lib/supabase.js'
 import { extractToken, formatTime } from '../lib/token.js'
 import { feedbackError, feedbackSuccess, unlockAudio } from '../lib/feedback.js'
-
-const READER_ID = 'reader'
+import {
+  cameraErrorText,
+  detachVideo,
+  listVideoDevices,
+  startBackCamera,
+  stopStream
+} from '../lib/camera.js'
 
 // Цвет экрана результата по коду ответа RPC
 function screenClass(code) {
@@ -24,6 +29,9 @@ function screenClass(code) {
   }
 }
 
+const DECODE_INTERVAL_MS = 100 // ~10 попыток распознавания в секунду
+const MAX_DECODE_SIDE = 640 // кадр уменьшается — так распознавание быстрее
+
 /**
  * mode: 'in'  → регистрация входа  (register_ticket_entry)
  * mode: 'out' → регистрация выхода (register_ticket_exit)
@@ -34,17 +42,24 @@ export default function Scanner({ mode }) {
     mode === 'in' ? 'register_ticket_entry' : 'register_ticket_exit'
 
   const [scanning, setScanning] = useState(false)
+  const [starting, setStarting] = useState(false)
   const [processing, setProcessing] = useState(false)
   const [result, setResult] = useState(null)
   const [cameraError, setCameraError] = useState('')
+  const [warning, setWarning] = useState('')
   const [cameras, setCameras] = useState([])
   const [deviceId, setDeviceId] = useState('')
 
-  const instRef = useRef(null)
+  const videoRef = useRef(null)
+  const streamRef = useRef(null)
+  const canvasRef = useRef(null)
+  const ctxRef = useRef(null)
+  const rafRef = useRef(0)
+  const lastDecodeRef = useRef(0)
   const lockRef = useRef(false)
   const deviceRef = useRef('')
-  // Все операции старт/стоп выполняются строго по очереди —
-  // иначе html5-qrcode ломается при быстрых переключениях.
+  const aliveRef = useRef(true)
+  // Все операции старт/стоп идут строго по очереди
   const chainRef = useRef(Promise.resolve())
 
   const enqueue = useCallback((fn) => {
@@ -52,30 +67,32 @@ export default function Scanner({ mode }) {
     return chainRef.current
   }, [])
 
-  const stopScanner = useCallback(async () => {
-    const inst = instRef.current
-    instRef.current = null
-    if (!inst) return
-    try {
-      if (inst.isScanning) await inst.stop()
-    } catch {
-      /* уже остановлен */
+  // ----------------------------------------------------------
+  // Остановка камеры и цикла распознавания
+  // ----------------------------------------------------------
+  const stopCamera = useCallback(async () => {
+    if (rafRef.current) {
+      cancelAnimationFrame(rafRef.current)
+      rafRef.current = 0
     }
-    try {
-      inst.clear()
-    } catch {
-      /* ignore */
+    if (streamRef.current) {
+      stopStream(streamRef.current)
+      streamRef.current = null
     }
+    detachVideo(videoRef.current)
+    setScanning(false)
   }, [])
 
+  // ----------------------------------------------------------
+  // Обработка распознанного QR
+  // ----------------------------------------------------------
   const handleDecoded = useCallback(
     async (decodedText) => {
       if (lockRef.current) return
       lockRef.current = true
 
-      // Камера останавливается сразу, чтобы один QR не считался дважды
-      enqueue(stopScanner)
-      setScanning(false)
+      // Камера гасится сразу, чтобы один QR не считался дважды
+      enqueue(stopCamera)
       setProcessing(true)
 
       const token = extractToken(decodedText)
@@ -84,6 +101,7 @@ export default function Scanner({ mode }) {
         ticket_token: token
       })
 
+      if (!aliveRef.current) return
       setProcessing(false)
 
       if (error) {
@@ -103,67 +121,159 @@ export default function Scanner({ mode }) {
       if (data?.success) feedbackSuccess()
       else feedbackError()
     },
-    [enqueue, rpcName, stopScanner]
+    [enqueue, rpcName, stopCamera]
   )
 
-  const startScanner = useCallback(async () => {
-    setCameraError('')
-    await stopScanner()
+  // ----------------------------------------------------------
+  // Цикл распознавания: кадр видео → canvas → jsQR
+  // ----------------------------------------------------------
+  const startDecodeLoop = useCallback(() => {
+    if (!canvasRef.current) {
+      canvasRef.current = document.createElement('canvas')
+      ctxRef.current = canvasRef.current.getContext('2d', {
+        willReadFrequently: true
+      })
+    }
 
-    if (!document.getElementById(READER_ID)) return
+    const tick = () => {
+      rafRef.current = requestAnimationFrame(tick)
 
-    try {
-      const inst = new Html5Qrcode(READER_ID, { verbose: false })
-      instRef.current = inst
-      lockRef.current = false
+      if (lockRef.current) return
 
-      const config = {
-        fps: 10,
-        qrbox: (w, h) => {
-          const size = Math.floor(Math.min(w, h) * 0.75)
-          return { width: size, height: size }
-        },
-        aspectRatio: 1.0
-      }
+      const video = videoRef.current
+      if (!video || video.readyState < 2 || !video.videoWidth) return
 
-      // По умолчанию — задняя камера смартфона
-      const cameraConfig = deviceRef.current
-        ? { deviceId: { exact: deviceRef.current } }
-        : { facingMode: { exact: 'environment' } }
+      const now = performance.now()
+      if (now - lastDecodeRef.current < DECODE_INTERVAL_MS) return
+      lastDecodeRef.current = now
+
+      const scale = Math.min(
+        1,
+        MAX_DECODE_SIDE / Math.max(video.videoWidth, video.videoHeight)
+      )
+      const w = Math.max(1, Math.floor(video.videoWidth * scale))
+      const h = Math.max(1, Math.floor(video.videoHeight * scale))
+
+      const canvas = canvasRef.current
+      const ctx = ctxRef.current
+      if (canvas.width !== w) canvas.width = w
+      if (canvas.height !== h) canvas.height = h
 
       try {
-        await inst.start(cameraConfig, config, handleDecoded, () => {})
+        ctx.drawImage(video, 0, 0, w, h)
+        const image = ctx.getImageData(0, 0, w, h)
+        const code = jsQR(image.data, w, h, {
+          inversionAttempts: 'dontInvert'
+        })
+        if (code && code.data) handleDecoded(code.data)
       } catch {
-        // Не на всех устройствах есть камера с exact:'environment'
-        await inst.start({ facingMode: 'environment' }, config, handleDecoded, () => {})
+        // кадр ещё не готов — пропускаем
+      }
+    }
+
+    if (rafRef.current) cancelAnimationFrame(rafRef.current)
+    lastDecodeRef.current = 0
+    rafRef.current = requestAnimationFrame(tick)
+  }, [handleDecoded])
+
+  // ----------------------------------------------------------
+  // Запуск камеры
+  // ----------------------------------------------------------
+  const startCamera = useCallback(async () => {
+    if (!aliveRef.current) return
+
+    setCameraError('')
+    setWarning('')
+    setStarting(true)
+
+    await stopCamera()
+
+    const video = videoRef.current
+    if (!video) {
+      setStarting(false)
+      return
+    }
+
+    try {
+      const { stream, deviceId: usedId, warning: warn } = await startBackCamera(
+        video,
+        { deviceId: deviceRef.current }
+      )
+
+      if (!aliveRef.current) {
+        stopStream(stream)
+        detachVideo(video)
+        return
+      }
+
+      streamRef.current = stream
+      lockRef.current = false
+      if (usedId) {
+        deviceRef.current = usedId
+        setDeviceId(usedId)
+      }
+      if (warn) setWarning(warn)
+
+      // Если поток оборвался (звонок, блокировка экрана) — перезапуск вручную
+      const track = stream.getVideoTracks()[0]
+      if (track) {
+        track.addEventListener('ended', () => {
+          if (!aliveRef.current) return
+          setScanning(false)
+          setWarning('Поток камеры прерван. Нажмите «Включить камеру».')
+        })
       }
 
       setScanning(true)
+      startDecodeLoop()
 
-      // Список камер доступен только после выданного разрешения
-      try {
-        const list = await Html5Qrcode.getCameras()
-        setCameras(list || [])
-      } catch {
-        setCameras([])
-      }
+      // Метки камер доступны только после выданного разрешения
+      const list = await listVideoDevices()
+      if (aliveRef.current) setCameras(list)
     } catch (e) {
-      instRef.current = null
-      setScanning(false)
-      setCameraError(
-        'Не удалось включить камеру. Разрешите доступ к камере в настройках браузера ' +
-          'и убедитесь, что сайт открыт по HTTPS. ' +
-          (e?.message ? `(${e.message})` : '')
-      )
+      if (!aliveRef.current) return
+      await stopCamera()
+      setCameraError(cameraErrorText(e))
+    } finally {
+      if (aliveRef.current) setStarting(false)
     }
-  }, [handleDecoded, stopScanner])
+  }, [startDecodeLoop, stopCamera])
 
+  // ----------------------------------------------------------
+  // Монтирование / размонтирование
+  // ----------------------------------------------------------
   useEffect(() => {
-    enqueue(startScanner)
+    aliveRef.current = true
+    enqueue(startCamera)
     return () => {
-      enqueue(stopScanner)
+      aliveRef.current = false
+      enqueue(stopCamera)
     }
-  }, [enqueue, startScanner, stopScanner])
+  }, [enqueue, startCamera, stopCamera])
+
+  // iOS замораживает камеру при уходе со страницы —
+  // возвращаясь, поток нужно «разбудить».
+  useEffect(() => {
+    function onVisible() {
+      if (document.visibilityState !== 'visible') return
+      const video = videoRef.current
+      if (!video || !streamRef.current || lockRef.current) return
+
+      const track = streamRef.current.getVideoTracks()[0]
+      if (!track || track.readyState === 'ended') {
+        enqueue(startCamera)
+        return
+      }
+      video.play().catch(() => enqueue(startCamera))
+    }
+
+    document.addEventListener('visibilitychange', onVisible)
+    window.addEventListener('pageshow', onVisible)
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible)
+      window.removeEventListener('pageshow', onVisible)
+    }
+  }, [enqueue, startCamera])
 
   // Разблокировка звука на iOS требует жеста пользователя
   useEffect(() => {
@@ -176,11 +286,14 @@ export default function Scanner({ mode }) {
     }
   }, [])
 
+  // ----------------------------------------------------------
+  // Действия пользователя
+  // ----------------------------------------------------------
   function restart() {
     unlockAudio()
     setResult(null)
     lockRef.current = false
-    enqueue(startScanner)
+    enqueue(startCamera)
   }
 
   function changeCamera(id) {
@@ -188,7 +301,14 @@ export default function Scanner({ mode }) {
     deviceRef.current = id
     setResult(null)
     lockRef.current = false
-    enqueue(startScanner)
+    enqueue(startCamera)
+  }
+
+  function nextCamera() {
+    if (cameras.length < 2) return
+    const idx = cameras.findIndex((c) => c.deviceId === deviceRef.current)
+    const next = cameras[(idx + 1 + cameras.length) % cameras.length]
+    if (next) changeCamera(next.deviceId)
   }
 
   return (
@@ -196,13 +316,50 @@ export default function Scanner({ mode }) {
       <div className="scan-title">{title}</div>
 
       {cameraError && <div className="error">{cameraError}</div>}
+      {warning && !cameraError && <div className="warning">{warning}</div>}
 
-      <div id={READER_ID} />
+      <div className="video-wrap">
+        <video
+          ref={videoRef}
+          className="scan-video"
+          playsInline
+          autoPlay
+          muted
+          disablePictureInPicture
+        />
+        <div className="scan-frame" />
+        {!scanning && !starting && (
+          <div className="video-placeholder">Камера выключена</div>
+        )}
+        {starting && <div className="video-placeholder">Включение камеры…</div>}
+      </div>
 
-      <div style={{ marginTop: 14 }}>
-        <button type="button" onClick={restart} disabled={processing}>
-          {scanning ? 'Перезапустить сканер' : 'Включить камеру'}
+      <div className="btn-row" style={{ marginTop: 14 }}>
+        <button
+          type="button"
+          className={scanning ? '' : 'btn-primary'}
+          onClick={restart}
+          disabled={processing || starting}
+          style={{ flex: '1 1 100%' }}
+        >
+          {starting
+            ? 'Включение…'
+            : scanning
+              ? 'Перезапустить сканер'
+              : 'Включить камеру'}
         </button>
+
+        {cameras.length > 1 && (
+          <button
+            type="button"
+            className="btn-sm"
+            onClick={nextCamera}
+            disabled={starting}
+            style={{ flex: '1 1 100%' }}
+          >
+            Сменить камеру
+          </button>
+        )}
       </div>
 
       {cameras.length > 1 && (
@@ -210,22 +367,14 @@ export default function Scanner({ mode }) {
           <label htmlFor="cam">Камера</label>
           <select
             id="cam"
+            className="select"
             value={deviceId}
             onChange={(e) => changeCamera(e.target.value)}
-            style={{
-              width: '100%',
-              fontSize: 17,
-              padding: 14,
-              borderRadius: 12,
-              background: 'var(--card)',
-              color: 'var(--text)',
-              border: '1px solid var(--border)'
-            }}
           >
-            <option value="">Задняя камера (по умолчанию)</option>
-            {cameras.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.label || c.id}
+            <option value="">Задняя камера (автовыбор)</option>
+            {cameras.map((c, i) => (
+              <option key={c.deviceId || i} value={c.deviceId}>
+                {c.label || `Камера ${i + 1}`}
               </option>
             ))}
           </select>
